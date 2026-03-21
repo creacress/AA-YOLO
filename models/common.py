@@ -1,6 +1,7 @@
 import math
 from copy import copy
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -2022,75 +2023,135 @@ class ST2CSPC(nn.Module):
 ##### Anomaly-Aware YOLO #####
 
 
+class ChannelAttention(nn.Module):
+    """Squeeze-and-Excitation channel attention module.
+
+    Learns per-channel importance weights to emphasize informative
+    channels for anomaly detection in infrared imagery.
+
+    Args:
+        channels: Number of input/output channels.
+        reduction: Channel reduction ratio for the bottleneck (default: 4).
+    """
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        mid = max(channels // reduction, 4)
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.size()
+        w = self.squeeze(x).view(b, c)
+        w = self.excitation(w).view(b, c, 1, 1)
+        return x * w
+
+
 class filtering2D(nn.Module):
-    # 2D filtering before statistical criterion
-    def __init__(self, ch1, ch2):
-        super(filtering2D, self).__init__()
+    """2D convolutional filtering module for anomaly-aware detection.
+
+    Applies two successive Conv→BN→ReLU blocks followed by channel
+    attention (SE module) to produce filtered feature maps before
+    statistical anomaly testing.
+
+    Args:
+        ch1: Number of input channels from the backbone feature map.
+        ch2: Number of output channels (typically na * aa_chan).
+        use_attention: Whether to apply channel attention (default: True).
+    """
+    def __init__(self, ch1: int, ch2: int, use_attention: bool = True) -> None:
+        super().__init__()
         self.conv1 = nn.Conv2d(ch1, ch2, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(ch2)
         self.act1 = nn.ReLU()
         self.conv2 = nn.Conv2d(ch2, ch2, kernel_size=3, stride=1, padding=1)
         self.bn2 = nn.BatchNorm2d(ch2)
         self.act2 = nn.ReLU()
+        self.attention = ChannelAttention(ch2) if use_attention else nn.Identity()
 
-    def forward(self, x):
-        y1 = self.conv1(x)
-        y1 = self.bn1(y1)
-        y1 = self.act1(y1)
-        y1 = self.conv2(y1)
-        y1 = self.bn2(y1)
-        y1 = self.act2(y1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y1 = self.act1(self.bn1(self.conv1(x)))
+        y1 = self.act2(self.bn2(self.conv2(y1)))
+        y1 = self.attention(y1)
         return y1
+
+Filtering2D = filtering2D  # PEP8 alias
 
 
 class lnGamma(Function):
+    """Custom autograd function for log of upper incomplete gamma function.
+
+    Computes log(Gamma_upper(a, x) / Gamma(a)) with numerically stable
+    backward pass when the output approaches zero. Used in the anomaly
+    score computation for statistical hypothesis testing.
+
+    The forward pass uses torch.special.gammaincc with a fallback
+    approximation for numerical stability when the result is inf/nan.
     """
-    Custom autograd function for log of upper incomplete gamma function, with stable backward when the output is close to zero.
-	"""
-    
-    @staticmethod
-    def forward(ctx,x, a=torch.tensor(1)):
-        ret = torch.log(torch.special.gammaincc(a, x))
-        mask = torch.isinf(ret) | torch.isnan(ret)
-        ret[mask] = - x[mask] + (a-1)* torch.log(x[mask]) - torch.special.gammaln(a) 
-        ctx.save_for_backward(x,a)
-        return ret 
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def forward(ctx, x: torch.Tensor, a: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if a is None:
+            a = torch.tensor(1, device=x.device)
+        ret = torch.log(torch.special.gammaincc(a, x))
+        mask = torch.isinf(ret) | torch.isnan(ret)
+        ret[mask] = - x[mask] + (a-1)* torch.log(x[mask]) - torch.special.gammaln(a)
+        ctx.save_for_backward(x,a)
+        return ret
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         x,a = ctx.saved_tensors
-        delta = -x**(a-1) * torch.exp(-x) / torch.special.gammaincc(a, x)     
+        delta = -x**(a-1) * torch.exp(-x) / torch.special.gammaincc(a, x)
         mask = torch.isinf(delta) | torch.isnan(delta)
-        delta[mask] = (a-1)/x[mask] -torch.tensor(1, device = x.device) 
+        delta[mask] = (a-1)/x[mask] -torch.tensor(1, device = x.device)
         return grad_output*delta, None
+
+LnGamma = lnGamma  # PEP8 alias
 
 def sigmoid(x):
     return 1/(1 + torch.exp(-x))
 
 
 class anomaly_testing(nn.Module):
-    """ Anomaly score prediction module
+    """Anomaly score prediction module.
+
+    Computes anomaly scores using statistical testing on filtered features.
+    Uses exponential moving average for stable inference.
+
+    Args:
+        alpha: Scaling factor for sigmoid activation (default: 0.05)
+        ema_momentum: Momentum for EMA updates during training (default: 0.1)
+        inference_ema_weight: Weight given to EMA estimate during inference (default: 0.15)
     """
-    def __init__(self):
+    EPS = 1e-7
+
+    def __init__(self, alpha=0.05, ema_momentum=0.1, inference_ema_weight=0.15):
         super().__init__()
+        self.alpha = alpha
+        self.ema_momentum = ema_momentum
+        self.inference_ema_weight = inference_ema_weight
 
     def forward(self, x):
         batch, C, h, w = x.size()
         meanx = torch.mean(x, dim=[1,2,3], keepdim=True).float()
         if not hasattr(self, 'lambda_ema'):
             self.register_buffer('lambda_ema', meanx.mean(0).detach())
-        if self.training: 
-            # compute and save EMA of meanx for each channel, and use it for more stable inference           
-            self.lambda_ema *= 0.9
-            self.lambda_ema += 0.1 * meanx.mean(0).detach()
-            lambda_chan = 1 / (meanx.float() + 10**(-7))
+        if self.training:
+            self.lambda_ema *= (1 - self.ema_momentum)
+            self.lambda_ema += self.ema_momentum * meanx.mean(0).detach()
+            lambda_chan = 1 / (meanx.float() + self.EPS)
             x = lambda_chan * x
         else:
-            lambda_chan = 1 / (meanx.float() + 10**(-7))
-            x = (0.07 * 1 / (self.lambda_ema + 10**(-7)) + 0.93 * lambda_chan) * x
+            lambda_chan = 1 / (meanx.float() + self.EPS)
+            x = (self.inference_ema_weight * 1 / (self.lambda_ema + self.EPS) + (1 - self.inference_ema_weight) * lambda_chan) * x
         x1 = torch.linalg.norm(x.float(), dim=1, ord=1, keepdim=True)
-        x1 = -lnGamma.apply(x1, torch.tensor(C, device = x1.device))
-
-        x1 = 2 * sigmoid(0.001 * x1) - 1  # activation function with parameter alpha = 0.001
-        
+        x1 = -lnGamma.apply(x1, torch.tensor(C, device=x1.device))
+        x1 = 2 * sigmoid(self.alpha * x1) - 1
         return x1
+
+AnomalyTesting = anomaly_testing  # PEP8 alias
