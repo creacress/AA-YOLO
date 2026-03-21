@@ -111,70 +111,106 @@ def train(hyp, opt, device, tb_writer=None):
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
-    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    pg0, pg1, pg2, pg_aa = [], [], [], []  # optimizer parameter groups
+    anomaly_lr_mult = hyp.get('anomaly_lr_mult', 2.0)  # learning rate multiplier for anomaly modules
+
     for k, v in model.named_modules():
+        # Check if this module is part of anomaly-aware modules
+        is_anomaly_module = 'filtering' in k or 'stat_test' in k
+
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
-            pg2.append(v.bias)  # biases
+            if is_anomaly_module:
+                pg_aa.append(v.bias)
+            else:
+                pg2.append(v.bias)  # biases
         if isinstance(v, nn.BatchNorm2d):
-            pg0.append(v.weight)  # no decay
+            if is_anomaly_module:
+                pg_aa.append(v.weight)
+            else:
+                pg0.append(v.weight)  # no decay
         elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
-            pg1.append(v.weight)  # apply decay
+            if is_anomaly_module:
+                pg_aa.append(v.weight)
+            else:
+                pg1.append(v.weight)  # apply decay
         if hasattr(v, 'im'):
-            if hasattr(v.im, 'implicit'):           
-                pg0.append(v.im.implicit)
+            if hasattr(v.im, 'implicit'):
+                param = v.im.implicit
+                (pg_aa if is_anomaly_module else pg0).append(param)
             else:
                 for iv in v.im:
-                    pg0.append(iv.implicit)
+                    param = iv.implicit
+                    (pg_aa if is_anomaly_module else pg0).append(param)
         if hasattr(v, 'imc'):
-            if hasattr(v.imc, 'implicit'):           
-                pg0.append(v.imc.implicit)
+            if hasattr(v.imc, 'implicit'):
+                param = v.imc.implicit
+                (pg_aa if is_anomaly_module else pg0).append(param)
             else:
                 for iv in v.imc:
-                    pg0.append(iv.implicit)
+                    param = iv.implicit
+                    (pg_aa if is_anomaly_module else pg0).append(param)
         if hasattr(v, 'imb'):
-            if hasattr(v.imb, 'implicit'):           
-                pg0.append(v.imb.implicit)
+            if hasattr(v.imb, 'implicit'):
+                param = v.imb.implicit
+                (pg_aa if is_anomaly_module else pg0).append(param)
             else:
                 for iv in v.imb:
-                    pg0.append(iv.implicit)
+                    param = iv.implicit
+                    (pg_aa if is_anomaly_module else pg0).append(param)
         if hasattr(v, 'imo'):
-            if hasattr(v.imo, 'implicit'):           
-                pg0.append(v.imo.implicit)
+            if hasattr(v.imo, 'implicit'):
+                param = v.imo.implicit
+                (pg_aa if is_anomaly_module else pg0).append(param)
             else:
                 for iv in v.imo:
-                    pg0.append(iv.implicit)
+                    param = iv.implicit
+                    (pg_aa if is_anomaly_module else pg0).append(param)
         if hasattr(v, 'ia'):
-            if hasattr(v.ia, 'implicit'):           
-                pg0.append(v.ia.implicit)
+            if hasattr(v.ia, 'implicit'):
+                param = v.ia.implicit
+                (pg_aa if is_anomaly_module else pg0).append(param)
             else:
                 for iv in v.ia:
-                    pg0.append(iv.implicit)
+                    param = iv.implicit
+                    (pg_aa if is_anomaly_module else pg0).append(param)
         if hasattr(v, 'attn'):
-            if hasattr(v.attn, 'logit_scale'):   
-                pg0.append(v.attn.logit_scale)
-            if hasattr(v.attn, 'q_bias'):   
-                pg0.append(v.attn.q_bias)
-            if hasattr(v.attn, 'v_bias'):  
-                pg0.append(v.attn.v_bias)
-            if hasattr(v.attn, 'relative_position_bias_table'):  
-                pg0.append(v.attn.relative_position_bias_table)
+            if hasattr(v.attn, 'logit_scale'):
+                param = v.attn.logit_scale
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.attn, 'q_bias'):
+                param = v.attn.q_bias
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.attn, 'v_bias'):
+                param = v.attn.v_bias
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.attn, 'relative_position_bias_table'):
+                param = v.attn.relative_position_bias_table
+                (pg_aa if is_anomaly_module else pg0).append(param)
         if hasattr(v, 'rbr_dense'):
-            if hasattr(v.rbr_dense, 'weight_rbr_origin'):  
-                pg0.append(v.rbr_dense.weight_rbr_origin)
-            if hasattr(v.rbr_dense, 'weight_rbr_avg_conv'): 
-                pg0.append(v.rbr_dense.weight_rbr_avg_conv)
-            if hasattr(v.rbr_dense, 'weight_rbr_pfir_conv'):  
-                pg0.append(v.rbr_dense.weight_rbr_pfir_conv)
-            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_idconv1'): 
-                pg0.append(v.rbr_dense.weight_rbr_1x1_kxk_idconv1)
-            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_conv2'):   
-                pg0.append(v.rbr_dense.weight_rbr_1x1_kxk_conv2)
-            if hasattr(v.rbr_dense, 'weight_rbr_gconv_dw'):   
-                pg0.append(v.rbr_dense.weight_rbr_gconv_dw)
-            if hasattr(v.rbr_dense, 'weight_rbr_gconv_pw'):   
-                pg0.append(v.rbr_dense.weight_rbr_gconv_pw)
-            if hasattr(v.rbr_dense, 'vector'):   
-                pg0.append(v.rbr_dense.vector)
+            if hasattr(v.rbr_dense, 'weight_rbr_origin'):
+                param = v.rbr_dense.weight_rbr_origin
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.rbr_dense, 'weight_rbr_avg_conv'):
+                param = v.rbr_dense.weight_rbr_avg_conv
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.rbr_dense, 'weight_rbr_pfir_conv'):
+                param = v.rbr_dense.weight_rbr_pfir_conv
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_idconv1'):
+                param = v.rbr_dense.weight_rbr_1x1_kxk_idconv1
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_conv2'):
+                param = v.rbr_dense.weight_rbr_1x1_kxk_conv2
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.rbr_dense, 'weight_rbr_gconv_dw'):
+                param = v.rbr_dense.weight_rbr_gconv_dw
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.rbr_dense, 'weight_rbr_gconv_pw'):
+                param = v.rbr_dense.weight_rbr_gconv_pw
+                (pg_aa if is_anomaly_module else pg0).append(param)
+            if hasattr(v.rbr_dense, 'vector'):
+                param = v.rbr_dense.vector
+                (pg_aa if is_anomaly_module else pg0).append(param)
 
     if opt.adam:
         optimizer = optim.Adam(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
@@ -183,8 +219,14 @@ def train(hyp, opt, device, tb_writer=None):
 
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-    logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
-    del pg0, pg1, pg2
+    # Add anomaly-aware module parameter group with higher learning rate
+    if len(pg_aa) > 0:
+        optimizer.add_param_group({'params': pg_aa, 'lr': hyp['lr0'] * anomaly_lr_mult})  # anomaly modules with higher lr
+        logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other, %g anomaly (lr=%.1e)' %
+                    (len(pg2), len(pg1), len(pg0), len(pg_aa), hyp['lr0'] * anomaly_lr_mult))
+    else:
+        logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    del pg0, pg1, pg2, pg_aa
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
     # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
