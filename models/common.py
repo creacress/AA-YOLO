@@ -1,3 +1,4 @@
+import logging
 import math
 from copy import copy
 from pathlib import Path
@@ -12,6 +13,8 @@ import torch.nn.functional as F
 from torchvision.ops import DeformConv2d
 from PIL import Image
 from torch.cuda import amp
+
+logger = logging.getLogger(__name__)
 
 from utils.datasets import letterbox
 from utils.general import non_max_suppression, make_divisible, scale_coords, increment_path, xyxy2xywh
@@ -2108,7 +2111,13 @@ class lnGamma(Function):
         x,a = ctx.saved_tensors
         delta = -x**(a-1) * torch.exp(-x) / torch.special.gammaincc(a, x)
         mask = torch.isinf(delta) | torch.isnan(delta)
+        nan_ratio = mask.float().mean().item()
+        if nan_ratio > 0.1:
+            logger.warning(f"lnGamma backward: {nan_ratio:.1%} of gradients are NaN/inf — "
+                           f"possible training instability (x range: [{x.min():.2e}, {x.max():.2e}])")
         delta[mask] = (a-1)/x[mask] -torch.tensor(1, device = x.device)
+        # Clamp gradients to prevent explosion
+        delta = delta.clamp(-1e4, 1e4)
         return grad_output*delta, None
 
 LnGamma = lnGamma  # PEP8 alias
@@ -2128,27 +2137,44 @@ class anomaly_testing(nn.Module):
         ema_momentum: Momentum for EMA updates during training (default: 0.1)
         inference_ema_weight: Weight given to EMA estimate during inference (default: 0.15)
     """
-    EPS = 1e-7
+    MIN_EPS = 1e-7
+    MAX_LAMBDA = 1e6  # Prevent extreme scaling values
 
     def __init__(self, alpha=0.05, ema_momentum=0.1, inference_ema_weight=0.15):
         super().__init__()
         self.alpha = alpha
         self.ema_momentum = ema_momentum
         self.inference_ema_weight = inference_ema_weight
+        # Register buffer in __init__ for deterministic checkpoint behavior
+        self.register_buffer('lambda_ema', torch.ones(1))
+        self._ema_initialized = False
+
+    def _safe_reciprocal(self, x):
+        """Compute 1/x with adaptive EPS to prevent extreme values in low-intensity scenes."""
+        eps = torch.clamp(x.abs().mean() * 1e-5, min=self.MIN_EPS)
+        result = 1.0 / (x.float() + eps)
+        return result.clamp(-self.MAX_LAMBDA, self.MAX_LAMBDA)
 
     def forward(self, x):
         batch, C, h, w = x.size()
         meanx = torch.mean(x, dim=[1,2,3], keepdim=True).float()
-        if not hasattr(self, 'lambda_ema'):
-            self.register_buffer('lambda_ema', meanx.mean(0).detach())
+
+        # Initialize EMA from first batch if not yet done
+        if not self._ema_initialized:
+            self.lambda_ema = meanx.mean(0).detach()
+            self._ema_initialized = True
+
         if self.training:
-            self.lambda_ema *= (1 - self.ema_momentum)
-            self.lambda_ema += self.ema_momentum * meanx.mean(0).detach()
-            lambda_chan = 1 / (meanx.float() + self.EPS)
+            self.lambda_ema = (1 - self.ema_momentum) * self.lambda_ema + \
+                              self.ema_momentum * meanx.mean(0).detach()
+            lambda_chan = self._safe_reciprocal(meanx)
             x = lambda_chan * x
         else:
-            lambda_chan = 1 / (meanx.float() + self.EPS)
-            x = (self.inference_ema_weight * 1 / (self.lambda_ema + self.EPS) + (1 - self.inference_ema_weight) * lambda_chan) * x
+            lambda_chan = self._safe_reciprocal(meanx)
+            lambda_ema_inv = self._safe_reciprocal(self.lambda_ema)
+            x = (self.inference_ema_weight * lambda_ema_inv +
+                 (1 - self.inference_ema_weight) * lambda_chan) * x
+
         x1 = torch.linalg.norm(x.float(), dim=1, ord=1, keepdim=True)
         x1 = -lnGamma.apply(x1, torch.tensor(C, device=x1.device))
         x1 = 2 * sigmoid(self.alpha * x1) - 1

@@ -513,6 +513,12 @@ class ComputeLoss:
         bs = tobj.shape[0]  # batch size
 
         loss = lbox + lobj + lcls
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"ComputeLoss: non-finite loss detected (lbox={lbox.item():.4f}, "
+                f"lobj={lobj.item():.4f}, lcls={lcls.item():.4f}). "
+                f"Check for NaN in targets or predictions."
+            )
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
     def build_targets(self, p, targets):
@@ -666,10 +672,16 @@ class ComputeLossOTA:
         bs = tobj.shape[0]  # batch size
 
         loss = lbox + lobj + lcls
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"ComputeLossOTA: non-finite loss detected (lbox={lbox.item():.4f}, "
+                f"lobj={lobj.item():.4f}, lcls={lcls.item():.4f}). "
+                f"Check for NaN in targets or predictions."
+            )
         return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
     def build_targets(self, p, targets, imgs):
-        
+
         #indices, anch = self.find_positive(p, targets)
         indices, anch = self.find_3_positive(p, targets)
         #indices, anch = self.find_4_positive(p, targets)
