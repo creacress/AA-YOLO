@@ -237,8 +237,8 @@ def train(hyp, opt, device, tb_writer=None):
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # plot_lr_scheduler(optimizer, scheduler, epochs)
 
-    # EMA
-    ema = ModelEMA(model) if rank in [-1, 0] else None
+    # EMA — epoch-aware decay scheduling: ramp from 0.999 to 0.9999
+    ema = ModelEMA(model, epochs=epochs) if rank in [-1, 0] else None
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
@@ -349,8 +349,11 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
+    last_opt_step = -1
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+        if ema:
+            ema.set_epoch(epoch)
 
         # Update image weights (optional)
         if opt.image_weights:
@@ -388,7 +391,8 @@ def train(hyp, opt, device, tb_writer=None):
                 # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                    # bias lr (j==2) falls from warmup_bias_lr to lr0
+                    # all other groups (including anomaly j==3) rise from 0.0 to their target lr
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
@@ -416,16 +420,23 @@ def train(hyp, opt, device, tb_writer=None):
                 if opt.quad:
                     loss *= 4.
 
+            # Scale loss by accumulation steps for correct gradient magnitude
+            if accumulate > 1:
+                loss = loss / accumulate
+
             # Backward
             scaler.scale(loss).backward()
 
-            # Optimize
-            if ni % accumulate == 0:
+            # Optimize — only step every `accumulate` batches
+            if ni - last_opt_step >= accumulate:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
                 if ema:
                     ema.update(model)
+                last_opt_step = ni
 
             # Print
             if rank in [-1, 0]:
