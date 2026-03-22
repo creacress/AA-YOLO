@@ -13,7 +13,15 @@ Usage:
 Requires: CUDA GPU, PyTorch with CUDA support
 """
 
+import os
 import sys
+
+# Ensure project root is on sys.path when running from scripts/
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+os.chdir(_PROJECT_ROOT)
+
 import time
 import torch
 import torch.nn as nn
@@ -49,7 +57,7 @@ def check_env():
     print(f"  CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     else:
         print(f"  {WARN} No CUDA GPU detected — GPU-specific tests will be skipped")
     print()
@@ -156,7 +164,15 @@ def test_torch_compile():
     from models.yolo import Model
     model = Model(cfg='cfg/training/AA-yolov7-tiny.yaml', ch=3, nc=1).cuda()
     model.eval()
-    compiled = torch.compile(model, mode='reduce-overhead')
+    # On Windows, Triton (inductor backend) is not available — fall back to eager
+    backend = 'inductor'
+    if sys.platform == 'win32':
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            backend = 'eager'
+            print(f"       {WARN} Triton unavailable on Windows, using backend='eager'")
+    compiled = torch.compile(model, mode='reduce-overhead', backend=backend)
     x = torch.randn(1, 3, 640, 640).cuda()
     with torch.no_grad():
         # First call triggers compilation (slow)
