@@ -290,6 +290,9 @@ class IDetect_AA(BaseDetect):
     def forward(self, x ):
         z = []  # inference output
         self.training |= self.export
+        # Propagate export flag to anomaly module for ONNX-compatible path
+        if hasattr(self, 'export') and self.export:
+            self.stat_test.export_mode = True
         for i in range(self.nl):
             xall = self.m[i](self.ia[i](x[i]))  # conv
             xall = self.im[i](xall)
@@ -320,6 +323,8 @@ class IDetect_AA(BaseDetect):
     def fuseforward(self, x):
         z = []  # inference output
         self.training |= self.export
+        if hasattr(self, 'export') and self.export:
+            self.stat_test.export_mode = True
         for i in range(self.nl):
             xall = self.m[i](x[i])  # conv
             bs, _, ny, nx = xall.shape  # x(bs,255,20,20) to x(bs,3,20,20,85)

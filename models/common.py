@@ -2145,6 +2145,10 @@ class anomaly_testing(nn.Module):
         self.alpha = alpha
         self.ema_momentum = ema_momentum
         self.inference_ema_weight = inference_ema_weight
+        self.export_mode = False  # Set True for ONNX export (avoids gammaincc)
+        # Temperature scaling for post-training confidence calibration
+        # Set via calibrate_temperature() after training; 1.0 = no effect
+        self.register_buffer('temperature', torch.ones(1))
         # Register buffer in __init__ for deterministic checkpoint behavior
         self.register_buffer('lambda_ema', torch.ones(1))
         self._ema_initialized = False
@@ -2176,8 +2180,38 @@ class anomaly_testing(nn.Module):
                  (1 - self.inference_ema_weight) * lambda_chan) * x
 
         x1 = torch.linalg.norm(x.float(), dim=1, ord=1, keepdim=True)
-        x1 = -lnGamma.apply(x1, torch.tensor(C, device=x1.device))
-        x1 = 2 * sigmoid(self.alpha * x1) - 1
+        if self.export_mode:
+            # ONNX-compatible approximation: log(gammaincc(a, x)) ≈ -x + (a-1)*log(x) - lgamma(a)
+            # This is the asymptotic expansion, valid for x >> a (typical at inference)
+            a = torch.tensor(float(C), device=x1.device)
+            x1_safe = x1.clamp(min=1e-6)
+            x1 = -(- x1_safe + (a - 1) * torch.log(x1_safe) - torch.lgamma(a))
+        else:
+            x1 = -lnGamma.apply(x1, torch.tensor(C, device=x1.device))
+        x1 = 2 * sigmoid(self.alpha * x1 / self.temperature) - 1
         return x1
+
+    def calibrate_temperature(self, val_scores, val_labels, lr=0.01, max_iter=50):
+        """Calibrate temperature scaling on a validation set (post-training).
+
+        Args:
+            val_scores: Tensor of raw anomaly scores from validation set.
+            val_labels: Binary tensor (1 = anomaly/target, 0 = background).
+            lr: Learning rate for temperature optimization.
+            max_iter: Maximum optimization iterations.
+        """
+        temperature = nn.Parameter(torch.ones(1, device=val_scores.device))
+        optimizer = torch.optim.LBFGS([temperature], lr=lr, max_iter=max_iter)
+        criterion = nn.BCEWithLogitsLoss()
+
+        def closure():
+            optimizer.zero_grad()
+            loss = criterion(val_scores / temperature, val_labels.float())
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        self.temperature.fill_(temperature.item())
+        return temperature.item()
 
 AnomalyTesting = anomaly_testing  # PEP8 alias
